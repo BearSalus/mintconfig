@@ -1,8 +1,13 @@
+use std::{env, io::Cursor};
+
+use reqwest::Client;
+use s3::{creds::Credentials, region::Region, Bucket};
+use serde_json::{json, Value};
 use tokio::sync::watch;
 use zksync_config::configs::eth_sender::SenderConfig;
 use zksync_contracts::BaseSystemContractsHashes;
 use zksync_dal::{Connection, ConnectionPool, Core, CoreDal};
-use zksync_eth_client::{BoundEthInterface, CallFunctionArgs};
+use zksync_eth_client::{BoundEthInterface, CallFunctionArgs, EthInterface};
 use zksync_l1_contract_interface::{
     i_executor::{
         commit::kzg::{KzgInfo, ZK_SYNC_BYTES_PER_BLOB},
@@ -18,11 +23,10 @@ use zksync_types::{
     eth_sender::{EthTx, EthTxBlobSidecar, EthTxBlobSidecarV1, SidecarBlobV1},
     ethabi::{Function, Token},
     l2_to_l1_log::UserL2ToL1Log,
-    protocol_version::{L1VerifierConfig, PACKED_SEMVER_MINOR_MASK},
-    pubdata_da::PubdataSendingMode,
-    settlement::SettlementMode,
+    protocol_version::{L1VerifierConfig, VerifierParams, PACKED_SEMVER_MINOR_MASK},
+    pubdata_da::PubdataDA,
     web3::{contract::Error as Web3ContractError, BlockNumber},
-    Address, L2ChainId, ProtocolVersionId, SLChainId, H256, U256,
+    Address, L2ChainId, ProtocolVersionId, H256, U256,
 };
 
 use super::aggregated_operations::AggregatedOperation;
@@ -35,9 +39,9 @@ use crate::{
 
 /// Data queried from L1 using multicall contract.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct MulticallData {
     pub base_system_contracts_hashes: BaseSystemContractsHashes,
+    pub verifier_params: VerifierParams,
     pub verifier_address: Address,
     pub protocol_version_id: ProtocolVersionId,
 }
@@ -63,8 +67,8 @@ pub struct EthTxAggregator {
     /// address.
     custom_commit_sender_addr: Option<Address>,
     pool: ConnectionPool<Core>,
-    settlement_mode: SettlementMode,
-    sl_chain_id: SLChainId,
+    // the ipfs hash queue
+    ipfs_hash_queue: Vec<String>,
 }
 
 struct TxData {
@@ -84,11 +88,12 @@ impl EthTxAggregator {
         state_transition_chain_contract: Address,
         rollup_chain_id: L2ChainId,
         custom_commit_sender_addr: Option<Address>,
-        settlement_mode: SettlementMode,
     ) -> Self {
         let eth_client = eth_client.for_component("eth_tx_aggregator");
         let functions = ZkSyncFunctions::default();
         let base_nonce = eth_client.pending_nonce().await.unwrap().as_u64();
+
+        let ipfs_hash_queue: Vec<String> = Vec::new();
 
         let base_nonce_custom_commit_sender = match custom_commit_sender_addr {
             Some(addr) => Some(
@@ -101,9 +106,6 @@ impl EthTxAggregator {
             ),
             None => None,
         };
-
-        let sl_chain_id = (*eth_client).as_ref().fetch_chain_id().await.unwrap();
-
         Self {
             config,
             aggregator,
@@ -117,8 +119,7 @@ impl EthTxAggregator {
             rollup_chain_id,
             custom_commit_sender_addr,
             pool,
-            settlement_mode,
-            sl_chain_id,
+            ipfs_hash_queue,
         }
     }
 
@@ -144,19 +145,19 @@ impl EthTxAggregator {
     }
 
     pub(super) async fn get_multicall_data(&mut self) -> Result<MulticallData, EthSenderError> {
-        let (calldata, evm_emulator_hash_requested) = self.generate_calldata_for_multicall();
+        let calldata = self.generate_calldata_for_multicall();
         let args = CallFunctionArgs::new(&self.functions.aggregate3.name, calldata).for_contract(
             self.l1_multicall3_address,
             &self.functions.multicall_contract,
         );
         let aggregate3_result: Token = args.call((*self.eth_client).as_ref()).await?;
-        self.parse_multicall_data(aggregate3_result, evm_emulator_hash_requested)
+        self.parse_multicall_data(aggregate3_result)
     }
 
     // Multicall's aggregate function accepts 1 argument - arrays of different contract calls.
     // The role of the method below is to tokenize input for multicall, which is actually a vector of tokens.
     // Each token describes a specific contract call.
-    pub(super) fn generate_calldata_for_multicall(&self) -> (Vec<Token>, bool) {
+    pub(super) fn generate_calldata_for_multicall(&self) -> Vec<Token> {
         const ALLOW_FAILURE: bool = false;
 
         // First zksync contract call
@@ -215,31 +216,14 @@ impl EthTxAggregator {
             calldata: get_protocol_version_input,
         };
 
-        let mut token_vec = vec![
+        // Convert structs into tokens and return vector with them
+        vec![
             get_bootloader_hash_call.into_token(),
             get_default_aa_hash_call.into_token(),
             get_verifier_params_call.into_token(),
             get_verifier_call.into_token(),
             get_protocol_version_call.into_token(),
-        ];
-
-        let mut evm_emulator_hash_requested = false;
-        let get_l2_evm_emulator_hash_input = self
-            .functions
-            .get_evm_emulator_bytecode_hash
-            .as_ref()
-            .and_then(|f| f.encode_input(&[]).ok());
-        if let Some(input) = get_l2_evm_emulator_hash_input {
-            let call = Multicall3Call {
-                target: self.state_transition_chain_contract,
-                allow_failure: ALLOW_FAILURE,
-                calldata: input,
-            };
-            token_vec.insert(2, call.into_token());
-            evm_emulator_hash_requested = true;
-        }
-
-        (token_vec, evm_emulator_hash_requested)
+        ]
     }
 
     // The role of the method below is to de-tokenize multicall call's result, which is actually a token.
@@ -247,7 +231,6 @@ impl EthTxAggregator {
     pub(super) fn parse_multicall_data(
         &self,
         token: Token,
-        evm_emulator_hash_requested: bool,
     ) -> Result<MulticallData, EthSenderError> {
         let parse_error = |tokens: &[Token]| {
             Err(EthSenderError::Parse(Web3ContractError::InvalidOutputType(
@@ -256,9 +239,8 @@ impl EthTxAggregator {
         };
 
         if let Token::Array(call_results) = token {
-            let number_of_calls = if evm_emulator_hash_requested { 6 } else { 5 };
-            // 5 or 6 calls are aggregated in multicall
-            if call_results.len() != number_of_calls {
+            // 5 calls are aggregated in multicall
+            if call_results.len() != 5 {
                 return parse_error(&call_results);
             }
             let mut call_results_iterator = call_results.into_iter();
@@ -287,31 +269,31 @@ impl EthTxAggregator {
                 )));
             }
             let default_aa = H256::from_slice(&multicall3_default_aa);
-
-            let evm_emulator = if evm_emulator_hash_requested {
-                let multicall3_evm_emulator =
-                    Multicall3Result::from_token(call_results_iterator.next().unwrap())?
-                        .return_data;
-                if multicall3_evm_emulator.len() != 32 {
-                    return Err(EthSenderError::Parse(Web3ContractError::InvalidOutputType(
-                        format!(
-                            "multicall3 EVM emulator hash data is not of the len of 32: {:?}",
-                            multicall3_evm_emulator
-                        ),
-                    )));
-                }
-                Some(H256::from_slice(&multicall3_evm_emulator))
-            } else {
-                None
-            };
-
             let base_system_contracts_hashes = BaseSystemContractsHashes {
                 bootloader,
                 default_aa,
-                evm_emulator,
             };
 
-            call_results_iterator.next().unwrap(); // FIXME: why is this value requested?
+            let multicall3_verifier_params =
+                Multicall3Result::from_token(call_results_iterator.next().unwrap())?.return_data;
+            if multicall3_verifier_params.len() != 96 {
+                return Err(EthSenderError::Parse(Web3ContractError::InvalidOutputType(
+                    format!(
+                        "multicall3 verifier params data is not of the len of 96: {:?}",
+                        multicall3_default_aa
+                    ),
+                )));
+            }
+            let recursion_node_level_vk_hash = H256::from_slice(&multicall3_verifier_params[..32]);
+            let recursion_leaf_level_vk_hash =
+                H256::from_slice(&multicall3_verifier_params[32..64]);
+            let recursion_circuits_set_vks_hash =
+                H256::from_slice(&multicall3_verifier_params[64..]);
+            let verifier_params = VerifierParams {
+                recursion_node_level_vk_hash,
+                recursion_leaf_level_vk_hash,
+                recursion_circuits_set_vks_hash,
+            };
 
             let multicall3_verifier_address =
                 Multicall3Result::from_token(call_results_iterator.next().unwrap())?.return_data;
@@ -347,6 +329,7 @@ impl EthTxAggregator {
 
             return Ok(MulticallData {
                 base_system_contracts_hashes,
+                verifier_params,
                 verifier_address,
                 protocol_version_id,
             });
@@ -355,7 +338,7 @@ impl EthTxAggregator {
     }
 
     /// Loads current verifier config on L1
-    async fn get_snark_wrapper_vk_hash(
+    async fn get_recursion_scheduler_level_vk_hash(
         &mut self,
         verifier_address: Address,
     ) -> Result<H256, EthSenderError> {
@@ -367,13 +350,14 @@ impl EthTxAggregator {
         Ok(vk_hash)
     }
 
-    #[tracing::instrument(skip_all, name = "EthTxAggregator::loop_iteration")]
+    #[tracing::instrument(skip(self, storage))]
     async fn loop_iteration(
         &mut self,
         storage: &mut Connection<'_, Core>,
     ) -> Result<(), EthSenderError> {
         let MulticallData {
             base_system_contracts_hashes,
+            verifier_params,
             verifier_address,
             protocol_version_id,
         } = self.get_multicall_data().await.map_err(|err| {
@@ -382,16 +366,18 @@ impl EthTxAggregator {
         })?;
         let contracts_are_pre_shared_bridge = protocol_version_id.is_pre_shared_bridge();
 
-        let snark_wrapper_vk_hash = self
-            .get_snark_wrapper_vk_hash(verifier_address)
+        let recursion_scheduler_level_vk_hash = self
+            .get_recursion_scheduler_level_vk_hash(verifier_address)
             .await
             .map_err(|err| {
                 tracing::error!("Failed to get VK hash from the Verifier {err:?}");
                 err
             })?;
         let l1_verifier_config = L1VerifierConfig {
-            snark_wrapper_vk_hash,
+            params: verifier_params,
+            recursion_scheduler_level_vk_hash,
         };
+
         if let Some(agg_op) = self
             .aggregator
             .get_next_ready_operation(
@@ -402,37 +388,168 @@ impl EthTxAggregator {
             )
             .await
         {
-            if self.config.tx_aggregation_paused {
-                tracing::info!(
-                    "Skipping sending operation of type {} for batches {}-{} \
-                as tx_aggregation_paused=true",
-                    agg_op.get_action_type(),
-                    agg_op.l1_batch_range().start(),
-                    agg_op.l1_batch_range().end()
-                );
-                return Ok(());
-            }
-            if self.config.tx_aggregation_only_prove_and_execute && !agg_op.is_prove_or_execute() {
-                tracing::info!(
-                    "Skipping sending commit operation for batches {}-{} \
-                as tx_aggregation_only_prove_and_execute=true",
-                    agg_op.l1_batch_range().start(),
-                    agg_op.l1_batch_range().end()
-                );
-                return Ok(());
-            }
-            let is_gateway = self.settlement_mode.is_gateway();
             let tx = self
-                .save_eth_tx(
-                    storage,
-                    &agg_op,
-                    contracts_are_pre_shared_bridge,
-                    is_gateway,
-                )
+                .save_eth_tx(storage, &agg_op, contracts_are_pre_shared_bridge)
                 .await?;
             Self::report_eth_tx_saving(storage, &agg_op, &tx).await;
+
+            // zkmintlayer: A method `save_mintlayer_tx` to send the op to ipfs and mintlayer.
+            self.save_mintlayer_tx(&agg_op).await;
         }
+
         Ok(())
+    }
+
+    async fn save_mintlayer_tx(&mut self, aggregated_op: &AggregatedOperation) {
+        // send op to ipfs through 4everland gateway
+        let api_key = env::var("4EVERLAND_API_KEY").unwrap();
+        let secret_key = env::var("4EVERLAND_SECRET_KEY").unwrap();
+        let bucket_name = env::var("4EVERLAND_BUCKET_NAME").unwrap();
+        let credentials =
+            Credentials::new(Some(&api_key), Some(&secret_key), None, None, None).unwrap();
+        // get the bucket according to the setup in 4everland dashboard
+        let bucket = Bucket::new(
+            &bucket_name,
+            Region::Custom {
+                region: "us-east-1".into(),
+                endpoint: "https://endpoint.4everland.co".into(), // this endpoint is fixed and should not be changed
+            },
+            credentials,
+        )
+        .unwrap();
+
+        // compute the doc name
+        let ipfs_doc_name = format! {"{}_block_{}_{}", aggregated_op.get_action_caption(), aggregated_op.l1_batch_range().start().0, aggregated_op.l1_batch_range().end().0};
+        // add each aggregated_op to ipfs
+        let mut contents = match &aggregated_op {
+            AggregatedOperation::Commit(prev_l1_batch, l1_batches, pubdata_da) => {
+                // tracing::info!("CommitBatches operation: ");
+                // tracing::info!("prev_l1_batch: {:?}", prev_l1_batch);
+                // tracing::info!("l1_batches: {:?}", l1_batches);
+                // tracing::info!("pubdata_da: {:?}", pubdata_da);
+
+                let contents = (prev_l1_batch, l1_batches, pubdata_da);
+                let data = Cursor::new(serde_json::to_string(&contents).unwrap());
+                data
+            }
+            AggregatedOperation::PublishProofOnchain(op) => {
+                // tracing::info!("ProveBatches operation: ");
+                // tracing::info!("prev_l1_batch: {:?}", op.prev_l1_batch);
+                // tracing::info!("l1_batches: {:?}", op.l1_batches);
+                // tracing::info!("proofs: {:?}", op.proofs);
+
+                let contents = (&op.prev_l1_batch, &op.l1_batches, &op.proofs);
+                let data = Cursor::new(serde_json::to_string(&contents).unwrap());
+                data
+            }
+            AggregatedOperation::Execute(op) => {
+                // tracing::info!("ExecuteBatches operation: ");
+                // tracing::info!("l1_batches: {:?}", op.l1_batches);
+
+                let contents = &op.l1_batches;
+                let data = Cursor::new(serde_json::to_string(&contents).unwrap());
+                data
+            }
+        };
+
+        // put this document to 4everland/ipfs
+        let response_data = bucket
+            .put_object_stream(&mut contents, ipfs_doc_name.clone())
+            .await
+            .unwrap();
+        tracing::info!(
+            "put {} to ipfs and get response code: {:?}",
+            ipfs_doc_name,
+            response_data.status_code()
+        );
+
+        // get the head of the document and obtain the ipfs hash
+        let (head, _) = bucket.head_object(ipfs_doc_name.clone()).await.unwrap();
+        let metadata = head.metadata.unwrap();
+        let hash = metadata.get("ipfs-hash").unwrap();
+        tracing::info!("get {} from ipfs with cid: {:?}", ipfs_doc_name, hash);
+        // add this hash to the queue
+        self.ipfs_hash_queue.push(hash.clone());
+
+        // if block_number reaches the BATCH_SIZE, report the hashes to ipfs and then mintlayer
+        let batch_size: usize = env::var("ML_BATCH_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10 as usize); // the number of aggregated operations for mintlayer, default to 10
+        let hash_queue_limit: usize = batch_size * 3; // the number of ipfs hashes in total to be sent to mintlayer
+        let root_hash: Option<String> = if self.ipfs_hash_queue.len() == hash_queue_limit {
+            let title = format!(
+                "batch_{}_{}",
+                self.ipfs_hash_queue[0],
+                self.ipfs_hash_queue.last().unwrap()
+            );
+            let contents = self.ipfs_hash_queue.clone();
+            let mut data = Cursor::new(serde_json::to_string(&contents).unwrap());
+
+            // put this document to 4everland/ipfs
+            let response_data = bucket
+                .put_object_stream(&mut data, title.clone())
+                .await
+                .unwrap();
+            tracing::info!(
+                "put hashes {} to ipfs and get response code: {:?}",
+                title,
+                response_data.status_code()
+            );
+
+            // get the head of the document and obtain the final root hash
+            let (head, _) = bucket.head_object(title.clone()).await.unwrap();
+            let metadata = head.metadata.unwrap();
+            let hash = metadata.get("ipfs-hash").unwrap();
+            tracing::info!(
+                "get hashes {} from ipfs with cid: {:?}",
+                ipfs_doc_name,
+                hash
+            );
+
+            // clear the queue
+            self.ipfs_hash_queue.clear();
+
+            Some(hash.into())
+        } else {
+            None
+        };
+
+        if root_hash.is_some() {
+            // mintlayer
+            let mintlayer_rpc_url = env::var("ML_RPC_URL").unwrap();
+            let mintlayer_client = Client::new();
+            let headers = {
+                let mut headers = reqwest::header::HeaderMap::new();
+                headers.insert("Content-Type", "application/json".parse().unwrap());
+                headers
+            };
+
+            // add the digest to mintlayer
+            let payload = json!({
+                "method": "address_deposit_data",
+                "params": {
+                    "data": hex::encode(root_hash.unwrap()), // try to convert the hash to hex string according to ASCII
+                    "account": 0, // default to use account 0
+                    "options": {}
+                },
+                "jsonrpc": "2.0",
+                "id": 1,
+            });
+            let response = mintlayer_client
+                .post(&mintlayer_rpc_url)
+                .headers(headers)
+                .json(&payload)
+                .send()
+                .await
+                .unwrap();
+            let response_text = response.text().await.unwrap();
+            let response_json: Value = serde_json::from_str(&response_text).unwrap();
+            tracing::info!(
+                "add root digest to mintlayer with L1 tx_info: {}",
+                serde_json::to_string(&response_json).unwrap()
+            );
+        }
     }
 
     async fn report_eth_tx_saving(
@@ -505,12 +622,11 @@ impl EthTxAggregator {
                     )
                 };
 
-                let l1_batch_for_sidecar =
-                    if PubdataSendingMode::Blobs == self.aggregator.pubdata_da() {
-                        Some(l1_batches[0].clone())
-                    } else {
-                        None
-                    };
+                let l1_batch_for_sidecar = if PubdataDA::Blobs == self.aggregator.pubdata_da() {
+                    Some(l1_batches[0].clone())
+                } else {
+                    None
+                };
 
                 Self::encode_commit_data(encoding_fn, &commit_data, l1_batch_for_sidecar)
             }
@@ -594,16 +710,15 @@ impl EthTxAggregator {
         storage: &mut Connection<'_, Core>,
         aggregated_op: &AggregatedOperation,
         contracts_are_pre_shared_bridge: bool,
-        is_gateway: bool,
     ) -> Result<EthTx, EthSenderError> {
         let mut transaction = storage.start_transaction().await.unwrap();
         let op_type = aggregated_op.get_action_type();
         // We may be using a custom sender for commit transactions, so use this
         // var whatever it actually is: a `None` for single-addr operator or `Some`
         // for multi-addr operator in 4844 mode.
-        let sender_addr = match (op_type, is_gateway) {
-            (AggregatedActionType::Commit, false) => self.custom_commit_sender_addr,
-            (_, _) => None,
+        let sender_addr = match op_type {
+            AggregatedActionType::Commit => self.custom_commit_sender_addr,
+            _ => None,
         };
         let nonce = self.get_next_nonce(&mut transaction, sender_addr).await?;
         let encoded_aggregated_op =
@@ -627,14 +742,7 @@ impl EthTxAggregator {
                 eth_tx_predicted_gas,
                 sender_addr,
                 encoded_aggregated_op.sidecar,
-                is_gateway,
             )
-            .await
-            .unwrap();
-
-        transaction
-            .eth_sender_dal()
-            .set_chain_id(eth_tx.id, self.sl_chain_id.0)
             .await
             .unwrap();
 
@@ -652,10 +760,9 @@ impl EthTxAggregator {
         storage: &mut Connection<'_, Core>,
         from_addr: Option<Address>,
     ) -> Result<u64, EthSenderError> {
-        let is_gateway = self.settlement_mode.is_gateway();
         let db_nonce = storage
             .eth_sender_dal()
-            .get_next_nonce(from_addr, is_gateway)
+            .get_next_nonce(from_addr)
             .await
             .unwrap()
             .unwrap_or(0);

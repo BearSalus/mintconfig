@@ -1,6 +1,7 @@
 # Image is always built from the server image to reuse the common parts
 # This image is expected to be built locally beforehand (implemented in the `zk` tool)
-ARG BASE_VERSION=latest2.0
+# ARG BASE_VERSION=latest2.0
+ARG BASE_VERSION=zkmintlayer
 FROM matterlabs/server-v2:${BASE_VERSION}
 
 WORKDIR /
@@ -24,7 +25,7 @@ ENV RUSTUP_HOME=/usr/local/rustup \
 RUN curl https://sh.rustup.rs -sSf | bash -s -- -y && \
     rustup install stable
 
-RUN cargo install sqlx-cli --version 0.8.0
+RUN cargo install sqlx-cli --version 0.7.3
 
 # Copy required packages while preserving the folders structure from the repo
 # It's required because these packages use relative paths to the SDK
@@ -34,6 +35,8 @@ COPY infrastructure/zk /infrastructure/zk
 COPY infrastructure/local-setup-preparation /infrastructure/local-setup-preparation
 # Copy dev configs
 COPY etc/env /etc/env
+# Copy `utils` tool
+COPY etc/utils /etc/utils
 # Copy test configs (required to list rich accounts)
 COPY etc/test_config /etc/test_config
 # Copy all the L1 contracts so they can be deployed
@@ -48,8 +51,11 @@ ENV ZKSYNC_ACTION=dont_ask
 
 # Build all the required TS packages
 
+# Build `utils` tool and link
+RUN cd /etc/utils && yarn && yarn link && cd /
 # Build `zk` tool
-RUN cd /infrastructure/zk && yarn && yarn build && cd /
+RUN cd /infrastructure/zk && yarn link utils && yarn && yarn build && cd /
+# RUN cd /infrastructure/zk && yarn && yarn build && cd /
 # Build `local-setup-preparation` tool
 RUN cd /infrastructure/local-setup-preparation && yarn && cd /
 # Build L1 contracts package (contracts themselves should be already built)
@@ -64,7 +70,7 @@ COPY package.json /
 
 # Copy DAL - needed to setup database schemas.
 COPY core/lib/dal core/lib/dal
-COPY prover/crates/lib/prover_dal prover/crates/lib/prover_dal
+COPY prover/prover_dal prover/prover_dal
 
 RUN mkdir /etc/env/l1-inits && mkdir /etc/env/l2-inits
 
